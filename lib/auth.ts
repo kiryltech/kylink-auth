@@ -3,7 +3,7 @@ import * as util from 'util'
 import * as crypto from 'crypto'
 import * as debug from 'debug'
 import {URL} from 'url'
-import {Tedis} from "tedis";
+import {TedisPool} from "tedis";
 
 const AUTH_CODE_TTL_MILLIS = 60000;
 const LOG = debug('kylink:auth');
@@ -12,11 +12,12 @@ const redisUrl = new URL(process.env.REDIS_URL);
 let redisOptions = {
     host: redisUrl.hostname,
     port: parseInt(redisUrl.port),
+    timeout: 1000,
 };
 if (redisUrl.password) {
     redisOptions['password'] = redisUrl.password;
 }
-const tedis = new Tedis(redisOptions);
+const tedisPool = new TedisPool(redisOptions);
 const app = express();
 const oauthConf = {
     clientId: process.env.OAUTH_CLIENT_ID,
@@ -45,8 +46,13 @@ app.get('/', async (req, res) => {
     // @ts-ignore
     const redirectUrl = decodeURIComponent(req.query.redirect_uri);
     const code = crypto.randomBytes(128).toString('base64url');
-    await tedis.set(`kylink:code:${code}`, '');
-    await tedis.pexpire(`kylink:code:${code}`, AUTH_CODE_TTL_MILLIS);
+    const tedis = await tedisPool.getTedis();
+    try {
+        await tedis.set(`kylink:code:${code}`, '');
+        await tedis.pexpire(`kylink:code:${code}`, AUTH_CODE_TTL_MILLIS);
+    } finally {
+        tedisPool.putTedis(tedis);
+    }
     res.redirect(util.format('%s?code=%s&state=%s',
         redirectUrl, code,
         req.query.state));
@@ -83,7 +89,9 @@ app.use('/token', async (req, res) => {
     const grantType = req.query.grant_type ?
         req.query.grant_type : req.body.grant_type;
     LOG(`grant_type: ${grantType}`);
-    if (grantType == 'authorization_code') {
+    const tedis = await tedisPool.getTedis();
+
+    async function authCodeRequest() {
         if (!req.body.code ||
             !(await tedis.exists(`kylink:code:${req.body.code}`))) {
             LOG(`Invalid or expired code: ${req.body.code}`);
@@ -99,7 +107,9 @@ app.use('/token', async (req, res) => {
             refresh_token: refreshToken,
             expires_in: oauthConf.tokenTTL,
         });
-    } else if (grantType === 'refresh_token') {
+    }
+
+    async function refreshTokenRequest() {
         const refreshToken = req.query.refresh_token ?
             req.query.refresh_token : req.body.refresh_token;
         if (!(await tedis.exists(`kylink:refresh:${refreshToken}`))) {
@@ -112,9 +122,19 @@ app.use('/token', async (req, res) => {
             access_token: generateAccessToken(),
             expires_in: oauthConf.tokenTTL,
         });
-    } else {
-        LOG(`Grant type '${grantType}' is unsupported.`)
-        res.status(400).send('Grant type is not supported.')
+    }
+
+    try {
+        if (grantType == 'authorization_code') {
+            await authCodeRequest();
+        } else if (grantType === 'refresh_token') {
+            await refreshTokenRequest();
+        } else {
+            LOG(`Grant type '${grantType}' is unsupported.`)
+            res.status(400).send('Grant type is not supported.')
+        }
+    } finally {
+        tedisPool.putTedis(tedis);
     }
 });
 
