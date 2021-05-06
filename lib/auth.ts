@@ -103,7 +103,7 @@ app.use('/token', async (req, res) => {
         const refreshToken = req.query.refresh_token ?
             req.query.refresh_token : req.body.refresh_token;
         if (!(await tedis.exists(`kylink:refresh:${refreshToken}`))) {
-            LOG(`Unknown refresh token: ${req.body.code}`);
+            LOG(`Unknown refresh token: ${refreshToken}`);
             res.status(401).send('Unauthorized.');
             return;
         }
